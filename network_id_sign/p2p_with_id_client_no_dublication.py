@@ -24,11 +24,7 @@ class Client(DatagramProtocol):
         print("working on id:", self.id)
     
     def startProtocol(self):
-        # self.transport.write("ready".encode('utf-8'), self.server)
-        self.hostname = input("Enter your ID:")
-        mes = { "type": "ID", "id": self.hostname }
-        mes_json = json.dumps(mes)
-        self.transport.write(mes_json.encode(), self.server)
+        self.host_name()
         
     def datagramReceived(self, datagram, addr):
         # datagram = datagram.decode('utf-8')
@@ -59,10 +55,7 @@ class Client(DatagramProtocol):
 
             elif data['type']=='invalidhost':
                 print(data['message'])
-                self.hostname = input("Enter your ID:")
-                mes = { "type": "ID", "id": self.hostname }
-                mes_json = json.dumps(mes)
-                self.transport.write(mes_json.encode(), self.server)
+                self.host_name()
 
             reactor.callInThread(self.send_message)
 
@@ -113,6 +106,12 @@ class Client(DatagramProtocol):
             mes_json = json.dumps(mes)
             for address in self.address.values():
                 self.transport.write(mes_json.encode(), address)
+    
+    def host_name(self):
+        self.hostname = input("Enter your ID:")
+        mes = { "type": "ID", "id": self.hostname }
+        mes_json = json.dumps(mes)
+        self.transport.write(mes_json.encode(), self.server)
 
 if __name__ == '__main__':
     port = randint(1000, 5000)
