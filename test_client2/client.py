@@ -1,6 +1,7 @@
 from typing import Any
 from twisted.internet.protocol import DatagramProtocol
 from twisted.internet import reactor
+from twisted.internet.task import LoopingCall
 from random import randint
 import json
 import copy
@@ -10,6 +11,8 @@ from hashlib import sha256
 
 from blockchain import Block, Blockchain
 import datetime as date
+
+import pandas as pd
 
 
 class Client(DatagramProtocol):
@@ -23,11 +26,17 @@ class Client(DatagramProtocol):
         self.public_key = None
         self.id = host, port
 
+        self.loop_calling = None
+        self.follower_time = None
+        self.election_time = None
         self.leader_votes = 0
         self.validation_votes = 0
         self.leader_flag = False
+        self.candidate_flag  =False
         self.follower_flag = True
-        self.temp_message = None
+        self.temp_message = []
+
+        self.df = pd.read_csv("C:\\Users\\avina\Desktop\\8002.csv")
 
         self.server = '127.0.0.1', 9999
         print("working on id:", self.id)
@@ -42,6 +51,7 @@ class Client(DatagramProtocol):
         print("Starting as follower .....")
         print("Connecting to Network ......")
         self.host_name()
+        self._follower()
     
     def host_name(self):
         self.hostname = None
@@ -49,6 +59,89 @@ class Client(DatagramProtocol):
         mes = { "type": "ID", "id": self.hostname }
         mes_json = json.dumps(mes)
         self.transport.write(mes_json.encode(), self.server)
+    
+    def _follower(self):
+        # self.loop_calling.stop
+        self.follower_flag = True
+        self.candidate_flag = False
+        self.leader_flag = False
+        print("Follower ...")
+        self.follower_time = reactor.callLater(10, self._candidate)
+    
+    def _candidate(self):
+        # self.loop_calling.stop
+        self.follower_flag = False
+        self.candidate_flag = True
+        self.leader_flag = False
+        self.follower_time = None
+        print("Candidate ...")
+        # send votting request for to other nodes
+        last_block = self.blockchain.get_latest_block()
+        mes = { "type": "leadervoting",
+               "index":last_block.index,
+                "message":f"voting for {self.hostname}"
+                }
+        
+        mes_json = json.dumps(mes)
+        for address in self.address.values():
+            self.transport.write(mes_json.encode(), address)
+
+        self.election_time = reactor.callLater(10, self._leader)
+        pass
+
+    def _leader(self):
+        if self.leader_votes >= 2:
+            self.follower_flag = False
+            self.candidate_flag = False
+            self.leader_flag = True
+            print("Leader ...")
+            self.loop_calling = LoopingCall(self.send_message)
+            self.loop_calling.start(5)
+            reactor.callLater(20, self.loop_calling.stop)
+            reactor.callLater(20, self._candidate)
+        
+        else:
+            self.leader_votes = 0
+            self.follower_flag = True
+            self.candidate_flag = False
+            self.leader_flag = False
+            print("Not becoming Leader ...")
+            self._follower()
+    
+    def send_message(self):
+        if self.follower_flag == False and self.candidate_flag == False and self.leader_flag == True:
+            last_block = self.blockchain.get_latest_block()
+            # request for data from all the nodes, create and send block to all the nodes
+            mes = { "type": "values",
+                "index":last_block.index
+                }
+            mes_json = json.dumps(mes)
+            for address in self.address.values():
+                self.transport.write(mes_json.encode(), address)
+            print("requested for data ...")
+            values = self.df.iloc[last_block.index]
+            self.temp_message.append(str(('p3',values['Consumed'],values['Produced'])))
+            reactor.callLater(3, self._block_sending)
+        
+    def _block_sending(self):
+        # create block and send
+        self.temp_block = self.blockchain.create_block(Block(index=Block.last_index + 1, timestamp=date.datetime.now(), data=str(self.temp_message), previous_hash=""))
+        mes = Block.to_dict(self.temp_block)
+        mes ['type'] = "block"
+        mes_json = json.dumps(mes)
+        for address in self.address.values():
+            self.transport.write(mes_json.encode(), address)
+        self.blockchain.add_block(self.temp_block)
+        self.temp_message.clear()
+
+        print("block added ....\n")
+        print("Block #" + str(self.temp_block.index))
+        print("Timestamp: " + str(self.temp_block.timestamp))
+        print("Data: " + str(self.temp_block.data))
+        print("Hash: " + self.temp_block.hash)
+        print("Previous Hash: " + self.temp_block.previous_hash)
+        print("\n")
+    
         
     def datagramReceived(self, datagram, addr):
         # datagram = datagram.decode('utf-8')
@@ -80,40 +173,21 @@ class Client(DatagramProtocol):
                 print(data['message'])
                 self.host_name()
 
-            reactor.callInThread(self.send_message)
-
-        # elif data['type']=='message':
-        #     # Extract message and signature
-        #     message_sign = data["message"].encode("utf-8")  # Encode for signing/verification
-        #     encoded_signature = data["signature"]
-        #     signature = base64.b64decode(encoded_signature)
-        #     try:
-        #         assert self.public_key.verify(signature, message_sign)
-        #         # print("Signature is valid.")
-        #         mes = { "type": "response",
-        #             "message": f"Signature is valid response from {self.hostname}",
-        #             }
-        #         mes_json = json.dumps(mes)
-        #         self.transport.write(mes_json.encode(), addr)
-        #         for key, val in self.address.items():
-        #             if val == addr:
-        #                 print(key, ":", data['message'])
-        #     except ecdsa.BadSignatureError:
-        #         for key, val in self.address.items():
-        #             if val == addr:
-        #                 print("Signature is invalid from : ",key)
+            # reactor.callInThread(self.send_message)
         
         elif data['type']=='leadervoting':
             print(data["message"])
-            if self.leader_flag == True and self.follower_flag == False:
+            last_block = self.blockchain.get_latest_block()
+            if self.leader_flag == False and (self.candidate_flag == True or self.follower_flag == True) and last_block.index == data['index']:
+                # We have to check the election term and index
                 mes = { "type": "leadervotingresponse",
-                    "message": "deny"
+                    "message": "approved"
                     }
                 mes_json = json.dumps(mes)
                 self.transport.write(mes_json.encode(), addr)
             else:
                 mes = { "type": "leadervotingresponse",
-                    "message": "approved"
+                    "message": "deny"
                     }
                 mes_json = json.dumps(mes)
                 self.transport.write(mes_json.encode(), addr)
@@ -125,39 +199,22 @@ class Client(DatagramProtocol):
                     if val == addr:
                         print(key, ":", data['message'] + "for leader election")
         
-        # elif data['type']=='response':
-        #     print(data["message"])
-        #     self.validation_votes+=1
-        
-        elif data['type']=='blockforvalidation':
-            # del data['type']
-            # self.validation_block = Block.from_dict(data)
-            last_block = self.blockchain.get_latest_block()
-            print("Voting for block validation ...")
-
-            if last_block.index == data['index']-1 and last_block.hash == data['previous_hash']:
-                # print('valied block')
-            
-                # print("Block #" + str(self.validation_block.index))
-                # print("Timestamp: " + self.validation_block.timestamp)
-                # print("Data: " + self.validation_block.data)
-                # print("Hash: " + self.validation_block.hash)
-                # print("Previous Hash: " + self.validation_block.previous_hash)
-                # print("\n")
-
-                # self.blockchain.add_block(self.validation_block)
-                mes = { "type": "blockforvalidationresponse",
-                    "message": "approved"
+        elif data['type']=='values':
+            index = data['index']
+            # check if this request is from leader or not if leader
+            # send sensor values to leader
+            values = self.df.iloc[index]
+            mes = { "type": "valuesresponse",
+                    "Host": 'p3',
+                    "Consumed": str(values['Consumed']),
+                    "Produced": str(values['Produced'])
                     }
-                mes_json = json.dumps(mes)
-                self.transport.write(mes_json.encode(), addr)
+            mes_json = json.dumps(mes)
+            self.transport.write(mes_json.encode(), addr)
         
-        elif data['type']=='blockforvalidationresponse':
-            if data["message"] == "approved":
-                self.validation_votes+=1
-                for key, val in self.address.items():
-                    if val == addr:
-                        print(key, ":", data['message'] + "for block validation")
+        elif data['type']=='valuesresponse':
+            # Note responses from all the nodes and form a list
+            self.temp_message.append(str((data['Host'],data['Consumed'],data['Produced'])))
         
         elif data['type']=='block':
             del data['type']
@@ -166,11 +223,19 @@ class Client(DatagramProtocol):
 
             print("block added ....\n")
             print("Block #" + str(new_block.index))
-            print("Timestamp: " + new_block.timestamp)
-            print("Data: " + new_block.data)
+            print("Timestamp: " + str(new_block.timestamp))
+            print("Data: " + str(new_block.data))
             print("Hash: " + new_block.hash)
             print("Previous Hash: " + new_block.previous_hash)
             print("\n")
+
+            if self.follower_flag == True:
+                self.follower_time.cancel()
+                self._follower()
+
+            elif self.candidate_flag == True:
+                self.election_time.cancel()
+                self._follower()
 
         
         else:
@@ -178,86 +243,6 @@ class Client(DatagramProtocol):
                     if val == addr:
                         print('Invalied data from : ',key)
         
-    
-    def leader_election(self):
-        if self.leader_votes >= 2:
-            print(f"Response count in 2 seconds: {self.leader_votes}")
-            print("Got sufficient votes and elected as leader")
-            self.leader_flag = True
-            self.follower_flag = False
-            self.message_validation()
-            print("Voting for validation started ...")
-            reactor.callLater(3, self.reset_follower)  # Reset leader and follower flags
-        else:
-            print(f"Response count in 2 seconds: {self.leader_votes}")
-            print("Got not enough votes and con't be a leader at this time")
-        self.leader_votes = 0  # Reset response count
-        print("Leader election ended ...")
-    
-    def reset_follower(self):
-        if self.validation_votes >=2:
-            mes = Block.to_dict(self.temp_block)
-            mes ['type'] = "block"
-            mes_json = json.dumps(mes)
-            for address in self.address.values():
-                self.transport.write(mes_json.encode(), address)
-            self.blockchain.add_block(self.temp_block)
-            print("new block added ...\n")
-            print("Block #" + str(self.temp_block.index))
-            print("Timestamp: " + str(self.temp_block.timestamp))
-            print("Data: " + self.temp_block.data)
-            print("Hash: " + self.temp_block.hash)
-            print("Previous Hash: " + self.temp_block.previous_hash)
-            print("\n")
-            print(f"Votes for validation: {self.validation_votes}")
-            print("Got sufficient votes created the block and distrubuted")
-        else:
-            print(f"Votes for validation: {self.validation_votes}")
-            print("Got insufficient votes can not create the block")
-        self.leader_flag = False
-        self.follower_flag = True
-        self.validation_votes = 0
-        self.temp_message = None
-        print("Validation election ended ...")
-        print("Leader time up and back to follower")
-    
-    def message_validation(self):
-        # message_sign = self.temp_message.encode('utf-8')
-        # signature = self.private_key.sign(message_sign)
-        # # Encode data as base64 string (common choice)
-        # encoded_signature = base64.b64encode(signature).decode("utf-8")
-
-        # mes = { "type": "message",
-        #         "message":self.temp_message,
-        #         "signature": encoded_signature
-        #         }
-
-        mes = {
-                'type' : "blockforvalidation",
-                'index' : self.temp_block.index,
-                'hash' : self.temp_block.hash,
-                'previous_hash' : self.temp_block.previous_hash
-            }
-        
-        mes_json = json.dumps(mes)
-        for address in self.address.values():
-            self.transport.write(mes_json.encode(), address)
-    
-
-    def send_message(self):
-        while True:
-            self.temp_message = input(":::")
-            self.temp_block = self.blockchain.create_block(Block(index=Block.last_index + 1, timestamp=date.datetime.now(), data=self.temp_message, previous_hash=""))
-
-            mes = { "type": "leadervoting",
-                "message":f"{self.hostname} want to become leader"
-                }
-        
-            mes_json = json.dumps(mes)
-            for address in self.address.values():
-                self.transport.write(mes_json.encode(), address)
-            print("leader election started ...")
-            reactor.callLater(2, self.leader_election)  # Reset counter after 2 seconds
     
 
 if __name__ == '__main__':
