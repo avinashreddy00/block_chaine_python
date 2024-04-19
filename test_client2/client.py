@@ -20,7 +20,7 @@ class Client(DatagramProtocol):
         if host == 'localhost':
             host = "127.0.0.1"
 
-        self.hostname = None
+        self.hostname = 'UNHMSDS03'
         self.address = {}
         self.private_key = None
         self.public_key = None
@@ -31,6 +31,13 @@ class Client(DatagramProtocol):
         self.election_time = None
         self.leader_votes = 0
         self.validation_votes = 0
+
+        self.election_term = 0
+        self.total_votes = 0
+        self.voted_for = []
+        self.load_election_data()
+        self.leader = None
+        
         self.leader_flag = False
         self.candidate_flag  =False
         self.follower_flag = True
@@ -54,11 +61,30 @@ class Client(DatagramProtocol):
         self._follower()
     
     def host_name(self):
-        self.hostname = None
-        self.hostname = input("Enter your ID:")
         mes = { "type": "ID", "id": self.hostname }
         mes_json = json.dumps(mes)
         self.transport.write(mes_json.encode(), self.server)
+
+    def load_election_data(self):
+        try:
+            with open("election_data.json", "r") as file:
+                saved_data = json.load(file)
+                self.election_term = saved_data.get("election_term", 0)
+                self.total_votes = saved_data.get("total_votes", 0)
+        except FileNotFoundError:
+            # If file does not exist, initialize variables
+            self.election_term = 0
+            self.total_votes = 0
+
+    def save_election_data(self):
+        data = {
+            "election_term": self.election_term,
+            "total_votes": self.total_votes,
+            "nodeid":f'{self.hostname}'
+        }
+        with open("election_data.json", "w") as file:
+            json.dump(data, file)
+
     
     def _follower(self):
         # self.loop_calling.stop
@@ -74,11 +100,22 @@ class Client(DatagramProtocol):
         self.candidate_flag = True
         self.leader_flag = False
         self.follower_time = None
+        
+        # Increment election term
+        self.election_term += 1
+
+        # Reset votes for this term
+        self.total_votes = 0
+        self.leader_votes = 0
+
         print("Candidate ...")
         # send votting request for to other nodes
         last_block = self.blockchain.get_latest_block()
+
         mes = { "type": "leadervoting",
                "index":last_block.index,
+               "term":self.election_term,
+               "nodeid":f'{self.hostname}',
                 "message":f"voting for {self.hostname}"
                 }
         
@@ -94,6 +131,17 @@ class Client(DatagramProtocol):
             self.follower_flag = False
             self.candidate_flag = False
             self.leader_flag = True
+            self.total_votes = self.leader_votes
+            self.save_election_data()
+            mes = { "type": "leader",
+               "nodeid":f'{self.hostname}'
+                }
+        
+            mes_json = json.dumps(mes)
+            for address in self.address.values():
+                self.transport.write(mes_json.encode(), address)
+            self.transport.write(mes_json.encode(), self.server)
+
             print("Leader ...")
             self.loop_calling = LoopingCall(self.send_message)
             self.loop_calling.start(5)
@@ -120,7 +168,8 @@ class Client(DatagramProtocol):
                 self.transport.write(mes_json.encode(), address)
             print("requested for data ...")
             values = self.df.iloc[last_block.index]
-            self.temp_message.append(str(('p3',values['Consumed'],values['Produced'])))
+            host = f'{self.hostname}'
+            self.temp_message.append(str((host,values['Consumed'],values['Produced'])))
             reactor.callLater(3, self._block_sending)
         
     def _block_sending(self):
@@ -131,6 +180,7 @@ class Client(DatagramProtocol):
         mes_json = json.dumps(mes)
         for address in self.address.values():
             self.transport.write(mes_json.encode(), address)
+        self.transport.write(mes_json.encode(), self.server)
         self.blockchain.add_block(self.temp_block)
         self.temp_message.clear()
 
@@ -180,6 +230,8 @@ class Client(DatagramProtocol):
             last_block = self.blockchain.get_latest_block()
             if self.leader_flag == False and (self.candidate_flag == True or self.follower_flag == True) and last_block.index == data['index']:
                 # We have to check the election term and index
+                # need to check the leader election term
+                self.voted_for.append(data['nodeid'])
                 mes = { "type": "leadervotingresponse",
                     "message": "approved"
                     }
@@ -198,14 +250,18 @@ class Client(DatagramProtocol):
                 for key, val in self.address.items():
                     if val == addr:
                         print(key, ":", data['message'] + "for leader election")
+                    
+        elif data['type']=='leader':
+            self.leader = data['nodeid']
         
         elif data['type']=='values':
             index = data['index']
             # check if this request is from leader or not if leader
             # send sensor values to leader
+            self.voted_for = []
             values = self.df.iloc[index]
             mes = { "type": "valuesresponse",
-                    "Host": 'p3',
+                    "Host": f'{self.hostname}',
                     "Consumed": str(values['Consumed']),
                     "Produced": str(values['Produced'])
                     }
